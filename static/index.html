@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Smart Energy Analyzer</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2.0.6/css/pico.classless.min.css">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+<style>
+  .row{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:1rem}
+  .box{position:relative;height:300px}
+  .card{background:var(--pico-card-background-color);border:1px solid var(--pico-muted-border-color);border-radius:8px;padding:.8rem 1rem}
+  .card b{display:block;font-size:1.5rem}
+  nav button{margin-right:.5rem;width:auto}
+  .heat td{padding:.25rem;text-align:center;font-size:.7rem}
+  [hidden]{display:none!important}
+  table{font-size:.85rem}
+</style>
+</head>
+<body>
+<header>
+  <h1>⚡ Smart Energy Analyzer</h1>
+  <p>Consumption analysis · anomaly detection · forecast · bill prediction</p>
+</header>
+<main>
+<details open>
+  <summary><b>Settings</b></summary>
+  <div class="row">
+    <label>Your CSV (optional - empty = demo hostel data)<input type="file" id="file" accept=".csv"></label>
+    <label>Property<select id="prop"></select></label>
+    <label>Currency<input id="cur" value="₹"></label>
+    <label>Tariff model<select id="model"><option value="flat">Flat rate</option><option value="tiered">Tiered slabs</option></select></label>
+  </div>
+  <div class="row" id="flat"><label>Price per kWh<input type="number" id="price" value="6" step="0.5" min="0"></label></div>
+  <div class="row" id="tiered" hidden>
+    <label>Slab 1 up to kWh<input type="number" id="u1" value="1000" min="1"></label><label>Rate 1<input type="number" id="r1" value="4" step="0.5" min="0"></label>
+    <label>Slab 2 up to kWh<input type="number" id="u2" value="3000" min="1"></label><label>Rate 2<input type="number" id="r2" value="5.5" step="0.5" min="0"></label>
+    <label>Rate above slab 2<input type="number" id="r3" value="7" step="0.5" min="0"></label>
+  </div>
+  <div class="row">
+    <label>Fixed monthly charge<input type="number" id="fixed" value="0" min="0"></label>
+    <label>Taxes / surcharge %<input type="number" id="extra" value="0" min="0"></label>
+    <label>Anomaly method<select id="method"><option value="zscore">Rolling z-score (C++ engine)</option><option value="iforest">Isolation Forest (ML)</option></select></label>
+    <label id="thrBox">z-threshold: <span id="thrV">4</span><input type="range" id="thr" min="2" max="8" step="0.5" value="4"></label>
+    <label id="contBox" hidden>Anomaly share %: <span id="contV">0.5</span><input type="range" id="cont" min="0.1" max="5" step="0.1" value="0.5"></label>
+    <label>Forecast days: <span id="horV">30</span><input type="range" id="hor" min="30" max="90" step="5" value="30"></label>
+  </div>
+  <button id="go">Analyze</button> <small id="status"></small>
+  <p><small>CSV columns: timestamp, property_id, property_type, consumption_kwh (kWh, not kW). <a href="/api/sample.csv">Download sample CSV</a></small></p>
+</details>
+
+<p id="err" role="alert" hidden></p>
+
+<div id="out" hidden>
+<nav>
+  <button data-tab="overview">📊 Overview</button><button data-tab="anomalies" class="secondary">🚨 Anomalies</button>
+  <button data-tab="forecast" class="secondary">🔮 Forecast &amp; Bill</button><button data-tab="quality" class="secondary">🧹 Data quality</button>
+</nav>
+
+<section id="tab-overview">
+  <div class="row" id="m-overview"></div>
+  <h4>Daily consumption (kWh)</h4><div class="box"><canvas id="c-daily"></canvas></div>
+  <div class="row">
+    <div><h4>Average hourly profile</h4><div class="box"><canvas id="c-hourly"></canvas></div></div>
+    <div><h4>Weekday × hour heatmap</h4><table class="heat" id="heat"></table></div>
+  </div>
+</section>
+
+<section id="tab-anomalies" hidden>
+  <div class="row" id="m-anom"></div>
+  <h4>Hourly consumption with anomalies</h4><div class="box"><canvas id="c-series"></canvas></div>
+  <div id="t-events"></div>
+  <details id="known" hidden><summary>Known synthetic events in demo data</summary><div id="t-known"></div></details>
+</section>
+
+<section id="tab-forecast" hidden>
+  <p id="fc-err" hidden></p>
+  <div id="fc-ok">
+    <div class="row" id="m-fc"></div>
+    <h4>Daily forecast (kWh)</h4><div class="box"><canvas id="c-fc"></canvas></div>
+    <div id="t-bill"></div>
+  </div>
+  <small id="disc"></small>
+</section>
+
+<section id="tab-quality" hidden>
+  <div class="row" id="m-q"></div>
+  <div id="t-invalid"></div>
+  <small>Missing days are not treated as zero; rows are never fixed silently.</small>
+</section>
+</div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const TEAL = '#0f766e', RED = '#dc2626', AMBER = '#f59e0b', GREY = '#94a3b8';
+const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+const charts = {};
+const fmt = (n, d = 0) => Number(n).toLocaleString('en-IN', {maximumFractionDigits: d});
+
+function chart(id, cfg) {
+  if (charts[id]) charts[id].destroy();
+  cfg.options = {responsive: true, maintainAspectRatio: false, animation: false, ...(cfg.options || {})};
+  charts[id] = new Chart($(id), cfg);
+}
+function cards(el, items) {
+  el.replaceChildren(...items.map(([label, value, sub]) => {
+    const c = document.createElement('div'); c.className = 'card';
+    const s = document.createElement('small'); s.textContent = label;
+    const b = document.createElement('b'); b.textContent = value;
+    c.append(s, b);
+    if (sub) { const x = document.createElement('small'); x.textContent = sub; c.append(x); }
+    return c;
+  }));
+}
+function table(el, rows, cols) {
+  el.replaceChildren();
+  if (!rows.length) return;
+  const t = document.createElement('table'), h = t.createTHead().insertRow();
+  cols.forEach(c => { const th = document.createElement('th'); th.textContent = c; h.append(th); });
+  const tb = t.createTBody();
+  rows.forEach(r => { const tr = tb.insertRow(); cols.forEach(c => { tr.insertCell().textContent = r[c] ?? ''; }); });
+  el.append(t);
+}
+const xTicks = {ticks: {maxTicksLimit: 10, maxRotation: 0}};
+
+function settings() {
+  return {
+    property: $('prop').value || null, method: $('method').value, threshold: +$('thr').value,
+    contamination: +$('cont').value / 100, horizon: +$('hor').value,
+    tariff: {currency: $('cur').value || '₹', model: $('model').value, price: +$('price').value,
+      fixed: +$('fixed').value, extra: +$('extra').value,
+      tiers: [{upto: +$('u1').value, rate: +$('r1').value}, {upto: +$('u2').value, rate: +$('r2').value}, {upto: null, rate: +$('r3').value}]}
+  };
+}
+
+function render(j) {
+  const m = j.meta, o = j.overview, a = j.anomalies, f = j.forecast, c = j.currency;
+  const p = $('prop');
+  if (p.options.length !== m.properties.length) p.replaceChildren(...m.properties.map(x => new Option(x, x)));
+  p.value = m.property;
+
+  cards($('m-overview'), [['Total consumption', fmt(o.total) + ' kWh'], ['Avg per day', fmt(o.avg_daily, 1) + ' kWh'],
+    ['Peak hour (avg)', String(o.peak_hour).padStart(2, '0') + ':00'], ['Bill, last 30 days', c + fmt(o.last30_bill), fmt(o.last30_kwh) + ' kWh']]);
+  chart('c-daily', {type: 'bar', data: {labels: o.daily.d, datasets: [{data: o.daily.kwh, backgroundColor: TEAL}]},
+    options: {plugins: {legend: {display: false}}, scales: {x: xTicks}}});
+  chart('c-hourly', {type: 'line', data: {labels: [...Array(24).keys()], datasets: [{data: o.hourly, borderColor: TEAL, tension: .3}]},
+    options: {plugins: {legend: {display: false}}}});
+  const flat = o.heat.flat().filter(v => v !== null), max = Math.max(...flat), min = Math.min(...flat);
+  const hm = $('heat'); hm.replaceChildren();
+  const hr = hm.insertRow(); hr.insertCell(); for (let h = 0; h < 24; h++) hr.insertCell().textContent = h;
+  o.heat.forEach((row, i) => {
+    const tr = hm.insertRow(); tr.insertCell().textContent = DAYS[i];
+    row.forEach(v => { const td = tr.insertCell(); if (v !== null) { td.style.background = `rgba(15,118,110,${(0.1 + 0.9 * (v - min) / (max - min || 1)).toFixed(2)})`; td.title = v; } });
+  });
+
+  cards($('m-anom'), [['Events found', a.count], ['Extra energy (high events)', fmt(a.extra_kwh, 1) + ' kWh'], ['Approx. extra cost', c + fmt(a.extra_cost)]]);
+  const an = new Set(a.series.anom);
+  chart('c-series', {type: 'line', data: {labels: a.series.t, datasets: [
+    {label: 'Hourly kWh', data: a.series.kwh, borderColor: GREY, borderWidth: 1, pointRadius: 0},
+    {label: 'Anomaly', data: a.series.kwh.map((v, i) => an.has(i) ? v : null), borderColor: RED, backgroundColor: RED, showLine: false, pointRadius: 4}]},
+    options: {scales: {x: xTicks}}});
+  table($('t-events'), a.events, ['start', 'end', 'hours', 'type', 'extra_kwh', 'peak_kwh']);
+  if (!a.events.length) $('t-events').textContent = 'No anomalies found.';
+  $('known').hidden = !m.known_events.length;
+  table($('t-known'), m.known_events, ['start', 'hours', 'extra_kwh_per_hour', 'note']);
+
+  $('fc-err').hidden = !f.error; $('fc-ok').hidden = !!f.error;
+  if (f.error) { $('fc-err').textContent = f.error; }
+  else {
+    cards($('m-fc'), [['Predicted next 30 days', fmt(f.pred_kwh) + ' kWh'], ['Predicted bill', c + fmt(f.pred_bill), `${f.pred_bill - f.prev_bill >= 0 ? '+' : ''}${fmt(f.pred_bill - f.prev_bill)} vs last 30 days`],
+      ['Likely range', `${c}${fmt(f.low_bill)} - ${c}${fmt(f.high_bill)}`]]);
+    const labels = [...f.hist.d, ...f.fc.d], nh = f.hist.d.length, pad = Array(nh).fill(null);
+    chart('c-fc', {type: 'line', data: {labels, datasets: [
+      {label: 'Actual', data: [...f.hist.kwh, ...Array(f.fc.d.length).fill(null)], borderColor: TEAL, pointRadius: 0},
+      {label: 'Forecast', data: [...pad, ...f.fc.kwh], borderColor: AMBER, pointRadius: 0},
+      {label: 'Low (95%)', data: [...pad, ...f.fc.low], borderWidth: 0, pointRadius: 0},
+      {label: 'High (95%)', data: [...pad, ...f.fc.high], borderWidth: 0, pointRadius: 0, fill: '-1', backgroundColor: 'rgba(245,158,11,.2)'}]},
+      options: {scales: {x: xTicks}}});
+    table($('t-bill'), Object.entries(f.breakdown).map(([k, v]) => ({Item: k, ['Amount (' + c + ')']: v})), ['Item', 'Amount (' + c + ')']);
+  }
+  $('disc').textContent = m.disclaimer;
+
+  cards($('m-q'), [['Valid rows', fmt(m.rows)], ['Rejected rows', m.invalid_count], ['Incomplete days', o.incomplete_days], ['Engine', m.engine, 'ML: ' + m.ml]]);
+  table($('t-invalid'), m.invalid, ['row', 'reason']);
+  $('out').hidden = false;
+}
+
+async function run() {
+  $('status').textContent = 'Analyzing…'; $('err').hidden = true;
+  const fd = new FormData(), f = $('file').files[0];
+  if (f) fd.append('file', f);
+  fd.append('settings', JSON.stringify(settings()));
+  try {
+    const res = await fetch('/api/analyze', {method: 'POST', body: fd});
+    const j = await res.json();
+    if (!res.ok) throw new Error(j.error || 'Request failed');
+    render(j); $('status').textContent = 'Done ✔';
+  } catch (e) {
+    $('err').textContent = '⚠️ ' + e.message; $('err').hidden = false; $('status').textContent = '';
+  }
+}
+
+document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
+  document.querySelectorAll('nav button').forEach(x => x.className = 'secondary'); b.className = '';
+  document.querySelectorAll('main section').forEach(s => s.hidden = s.id !== 'tab-' + b.dataset.tab);
+  Object.values(charts).forEach(c => c.resize());
+});
+const link = (id, vid) => $(id).oninput = () => $(vid).textContent = $(id).value;
+link('thr', 'thrV'); link('cont', 'contV'); link('hor', 'horV');
+$('model').onchange = () => { $('flat').hidden = $('model').value !== 'flat'; $('tiered').hidden = $('model').value !== 'tiered'; };
+$('method').onchange = () => { $('thrBox').hidden = $('method').value !== 'zscore'; $('contBox').hidden = $('method').value !== 'iforest'; };
+$('go').onclick = run; $('prop').onchange = run;
+run();
+</script>
+</body>
+</html>
